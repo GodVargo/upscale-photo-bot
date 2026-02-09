@@ -1,21 +1,25 @@
 """
 Upscaler Photo Bot — Telegram-бот для апскейла фото с помощью AI
-С PostgreSQL для постоянного хранения пользователей
+С HTTP API для WebApp и PostgreSQL для хранения пользователей
 """
 import asyncio
 import logging
 import os
 import csv
 import io
+import json
+import base64
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
 
+import aiohttp
+from aiohttp import web
 import psycopg2
 from psycopg2.extras import RealDictCursor
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command
-from aiogram.types import Message, WebAppInfo, BufferedInputFile
+from aiogram.types import Message, WebAppInfo, BufferedInputFile, WebAppData
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 load_dotenv()
@@ -30,10 +34,14 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 WEBAPP_URL = os.getenv("WEBAPP_URL", "https://godvargo.github.io/upscale-photo-webapp/")
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
 DATABASE_URL = os.getenv("DATABASE_URL")
+DEEPAI_API_KEY = os.getenv("DEEPAI_API_KEY", "463910db-7f7d-4bc2-9f3d-76dfbc8038d5")
+PORT = int(os.getenv("PORT", 8080))
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
+
+# ============ DATABASE ============
 
 def get_db():
     """Подключение к PostgreSQL"""
@@ -129,6 +137,93 @@ def export_users():
     return rows
 
 
+# ============ HTTP API для WebApp ============
+
+async def handle_upscale(request):
+    """API endpoint для апскейла изображения через DeepAI"""
+    logger.info("📥 Получен запрос на апскейл")
+    
+    try:
+        # Читаем multipart данные
+        reader = await request.multipart()
+        image_data = None
+        
+        async for part in reader:
+            if part.name == 'image':
+                image_data = await part.read()
+                logger.info(f"📁 Получено изображение: {len(image_data)} байт")
+        
+        if not image_data:
+            return web.json_response({'error': 'No image provided'}, status=400)
+        
+        # Отправляем на DeepAI
+        logger.info("🚀 Отправляем на DeepAI...")
+        
+        async with aiohttp.ClientSession() as session:
+            form = aiohttp.FormData()
+            form.add_field('image', image_data, filename='image.jpg', content_type='image/jpeg')
+            
+            async with session.post(
+                'https://api.deepai.org/api/waifu2x',
+                data=form,
+                headers={'api-key': DEEPAI_API_KEY}
+            ) as resp:
+                result = await resp.json()
+                logger.info(f"📦 Ответ DeepAI: {result}")
+                
+                if 'output_url' in result:
+                    # Скачиваем результат и возвращаем как base64
+                    async with session.get(result['output_url']) as img_resp:
+                        img_bytes = await img_resp.read()
+                        img_base64 = base64.b64encode(img_bytes).decode('utf-8')
+                        
+                        return web.json_response({
+                            'success': True,
+                            'output_url': result['output_url'],
+                            'image_base64': f"data:image/png;base64,{img_base64}"
+                        })
+                else:
+                    return web.json_response({
+                        'success': False,
+                        'error': result.get('err', 'Unknown error')
+                    }, status=500)
+    
+    except Exception as e:
+        logger.error(f"❌ Ошибка апскейла: {e}")
+        return web.json_response({'error': str(e)}, status=500)
+
+
+async def handle_health(request):
+    """Health check endpoint"""
+    return web.json_response({'status': 'ok'})
+
+
+async def handle_cors_preflight(request):
+    """Handle CORS preflight requests"""
+    return web.Response(
+        headers={
+            'Access-Control-Allow-Origin': '*',
+            'Access-Control-Allow-Methods': 'POST, GET, OPTIONS',
+            'Access-Control-Allow-Headers': 'Content-Type',
+        }
+    )
+
+
+@web.middleware
+async def cors_middleware(request, handler):
+    """Middleware для CORS"""
+    if request.method == 'OPTIONS':
+        return await handle_cors_preflight(request)
+    
+    response = await handler(request)
+    response.headers['Access-Control-Allow-Origin'] = '*'
+    response.headers['Access-Control-Allow-Methods'] = 'POST, GET, OPTIONS'
+    response.headers['Access-Control-Allow-Headers'] = 'Content-Type'
+    return response
+
+
+# ============ BOT HANDLERS ============
+
 @dp.message(Command("start"))
 async def cmd_start(message: Message):
     """Обработчик команды /start"""
@@ -170,7 +265,7 @@ async def cmd_help(message: Message):
         "2. Загрузите изображение\n"
         "3. Выберите масштаб (2x или 4x)\n"
         "4. Нажмите «Улучшить»\n"
-        "5. Скачайте результат",
+        "5. Нажмите «Отправить в чат» — получите файл!",
         parse_mode="HTML"
     )
 
@@ -279,12 +374,71 @@ async def handle_photo(message: Message):
     )
 
 
-async def main():
+@dp.message(F.web_app_data)
+async def handle_webapp_data(message: Message):
+    """Обработчик данных от WebApp — отправляет результат пользователю"""
+    logger.info(f"📥 Получены данные от WebApp: {message.web_app_data.data[:100]}...")
+    
+    try:
+        data = json.loads(message.web_app_data.data)
+        
+        if data.get('action') == 'send_result':
+            # Получаем base64 изображение
+            image_base64 = data.get('image', '')
+            
+            if image_base64.startswith('data:image'):
+                # Убираем префикс data:image/png;base64,
+                image_base64 = image_base64.split(',')[1]
+            
+            image_bytes = base64.b64decode(image_base64)
+            
+            # Отправляем как документ
+            file = BufferedInputFile(
+                image_bytes, 
+                filename=f"upscaled_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png"
+            )
+            
+            await message.answer_document(
+                file,
+                caption="✅ Вот ваше улучшенное изображение!"
+            )
+            logger.info("✅ Изображение отправлено пользователю")
+        
+    except Exception as e:
+        logger.error(f"❌ Ошибка обработки WebApp данных: {e}")
+        await message.answer("❌ Ошибка при обработке изображения. Попробуйте ещё раз.")
+
+
+async def run_bot():
     """Запуск бота"""
-    init_db()
-    logger.info("🚀 Запуск Upscaler Photo Bot...")
     await bot.delete_webhook(drop_pending_updates=True)
     await dp.start_polling(bot)
+
+
+async def run_server():
+    """Запуск HTTP API сервера"""
+    app = web.Application(middlewares=[cors_middleware])
+    app.router.add_post('/upscale', handle_upscale)
+    app.router.add_get('/health', handle_health)
+    app.router.add_options('/upscale', handle_cors_preflight)
+    
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, '0.0.0.0', PORT)
+    await site.start()
+    logger.info(f"🌐 HTTP API запущен на порту {PORT}")
+
+
+async def main():
+    """Запуск бота и HTTP сервера"""
+    init_db()
+    logger.info("🚀 Запуск Upscaler Photo Bot...")
+    
+    # Запускаем оба: бота и HTTP сервер
+    await asyncio.gather(
+        run_bot(),
+        run_server()
+    )
 
 
 if __name__ == "__main__":
