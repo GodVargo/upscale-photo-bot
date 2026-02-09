@@ -1,0 +1,4 @@
+aiogram==3.17.0
+python-dotenv
+psycopg2-binary
+aiohttp
